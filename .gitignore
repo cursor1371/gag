@@ -1,0 +1,36 @@
+# ---- Build Output ----
+/gag
+/gag.exe
+
+# ---- Runtime Generated Files ----
+# config.yaml 由网关首次启动时自动创建，不纳入版本控制
+# config.example.yaml 是模板文件，需纳入版本控制
+config.yaml
+config.yaml.bak
+
+# ---- Logs ----
+/logs/
+
+# ---- Data Directory (Docker volume mount) ----
+/data/
+
+# ---- Temp Files ----
+*.tmp
+.gag-*
+
+# ---- IDE / Editor ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---- Go ----
+/vendor/

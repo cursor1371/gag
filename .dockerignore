@@ -1,0 +1,50 @@
+# ---- Version Control ----
+.git
+.gitignore
+.gitattributes
+
+# ---- CI/CD ----
+.github
+
+# ---- Documentation ----
+README.md
+LICENSE
+CHANGELOG.md
+*.md
+!go.md
+
+# ---- Configuration Templates (not needed in build) ----
+config.example.yaml
+
+# ---- Runtime Data (host-specific) ----
+config.yaml
+config.yaml.bak
+logs/
+data/
+
+# ---- Build Artifacts ----
+gag
+gag.exe
+*.tmp
+.gag-*
+
+# ---- Docker (prevent recursive context) ----
+Dockerfile
+.dockerignore
+docker-compose*.yml
+docker-compose*.yaml
+
+# ---- IDE / Editor ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Scripts (not needed in image) ----
+bootstrap.sh
