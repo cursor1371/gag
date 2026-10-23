@@ -7,8 +7,8 @@
 //  4. 接收节点响应（流式/非流式），写入 HTTP 响应
 //  5. 失败时按重试策略选择新节点重试
 //
-// 大请求优化：使用流式 JSON 编码将 HTTP Body 嵌入 WS 消息，
-// 峰值内存仅需 32-64KB 缓冲区，而非完整 body 副本。
+// WS 发送阶段使用流式 JSON 编码，避免额外构造完整 body 字符串副本。
+// 请求规范化命中目标字段时，仍会读取完整正文并按需重新编码。
 
 package main
 
@@ -115,13 +115,11 @@ func spoolBody(ctx context.Context, body io.Reader) (*os.File, error) {
 }
 
 // multiScan 在文件中单次顺序扫描，同时检测多个字节模式。
-// 使用 32KB 缓冲区，带重叠处理跨块边界的匹配。
-// 文件刚被写入，内容在 OS 页缓存中，扫描为纯内存操作。
-// 返回与 patterns 等长的 bool 切片，表示各模式是否被找到。
-func multiScan(file *os.File, patterns [][]byte) []bool {
+// 使用 32KB 缓冲区并保留重叠区域，避免跨块边界漏匹配。
+// 成功时返回各模式的命中状态，并将文件位置复位到开头。
+func multiScan(file *os.File, patterns [][]byte) ([]bool, error) {
 	found := make([]bool, len(patterns))
 
-	// 计算重叠区域大小（最大模式长度 - 1），确保跨块边界的模式不被遗漏
 	maxLen := 0
 	for _, p := range patterns {
 		if len(p) > maxLen {
@@ -137,15 +135,16 @@ func multiScan(file *os.File, patterns [][]byte) []bool {
 	buf := make([]byte, chunkSize+overlap)
 	carry := 0
 
-	file.Seek(0, io.SeekStart)
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
 	for {
 		n, readErr := file.Read(buf[carry:])
-		total := carry + n
-		if total == 0 && readErr != nil {
-			break
+		if readErr != nil && readErr != io.EOF {
+			return nil, readErr
 		}
+		total := carry + n
 
-		// 在当前缓冲区中检测所有未命中的模式
 		allFound := true
 		for i, p := range patterns {
 			if !found[i] {
@@ -156,135 +155,236 @@ func multiScan(file *os.File, patterns [][]byte) []bool {
 				}
 			}
 		}
-		if allFound {
-			break // 所有模式均已找到，提前结束
+		if allFound || readErr == io.EOF {
+			break
 		}
 
-		// 保留末尾 overlap 字节用于下次跨块边界匹配
+		// 保留末尾 overlap 字节用于下次跨块边界匹配。
 		if overlap > 0 && total > overlap {
 			copy(buf, buf[total-overlap:total])
 			carry = overlap
 		} else {
 			carry = total
 		}
-
-		if readErr != nil {
-			break
-		}
 	}
 
-	file.Seek(0, io.SeekStart)
-	return found
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return found, nil
 }
 
-// normalizeRequestBody 对请求体执行 Gemini API 兼容性规范化处理。
-//
-// 采用两阶段处理，在保证正确性的前提下最小化性能开销：
-//
-// Phase 1（所有 POST 请求执行）：以 32KB 缓冲区单次扫描文件，同时检测 3 个目标模式。
-// 文件刚被 spoolBody 写入，整个内容在 OS 页缓存中，无磁盘 I/O。
-// 无命中时立即返回 false，零额外内存分配。
-//
-// Phase 2（仅命中时执行）：使用 map[string]json.RawMessage 浅解析 JSON 顶层结构。
-// contents 等大字段保持原始字节不深度解析，仅对 generationConfig 和 tools
-// 执行精确的结构化修改。
-//
-// 处理的兼容性问题：
-//   - thinkingLevel 值规范化（"high" → "HIGH" 等）
-//   - tools[].functionDeclarations[].parameters → parametersJsonSchema
-//   - tools[].functionDeclarations[].response → responseJsonSchema
-//   - generationConfig.responseSchema → responseJsonSchema
-//
-// 返回 true 表示进行了修改。
-func normalizeRequestBody(file *os.File) bool {
-	// Phase 1: 单次文件扫描，同时检测所有目标模式
-	patterns := [][]byte{
-		[]byte(`"thinkingLevel"`),
-		[]byte(`"functionDeclarations"`),
-		[]byte(`"responseSchema"`),
-	}
-	hits := multiScan(file, patterns)
-	needThinking := hits[0]
-	needTools := hits[1]
-	needSchema := hits[2]
-
-	if !needThinking && !needTools && !needSchema {
-		return false
-	}
-
-	// Phase 2: JSON 结构化修改
-	data, err := io.ReadAll(file)
-	if err != nil {
-		file.Seek(0, io.SeekStart)
-		return false
-	}
-
-	// 顶层浅解析：contents 等大字段作为 RawMessage 保留原始字节
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(data, &top); err != nil {
-		file.Seek(0, io.SeekStart)
-		return false
+// normalizeSchema 只规范化 Schema 节点的字符串 type，递归 properties/items/anyOf。
+// 非对象和异常子结构原样保留；不进入 example、default、enum 等业务数据。
+// 无变化时返回原 RawMessage；error 仅表示内存重编码失败。
+func normalizeSchema(raw json.RawMessage) (json.RawMessage, bool, error) {
+	var schema map[string]json.RawMessage
+	if json.Unmarshal(raw, &schema) != nil || schema == nil {
+		return raw, false, nil
 	}
 
 	changed := false
+	var kind string
+	if json.Unmarshal(schema["type"], &kind) == nil {
+		if upper := strings.ToUpper(kind); upper != kind {
+			encoded, err := json.Marshal(upper)
+			if err != nil {
+				return raw, false, err
+			}
+			schema["type"] = encoded
+			changed = true
+		}
+	}
 
-	// ── generationConfig 处理 ──
-	// thinkingLevel 值规范化 + responseSchema 重命名
-	if (needThinking || needSchema) && len(top["generationConfig"]) > 0 {
-		var gc map[string]json.RawMessage
-		if json.Unmarshal(top["generationConfig"], &gc) == nil {
-			gcChanged := false
-
-			// thinkingConfig.thinkingLevel: 值映射（high → HIGH 等）
-			if needThinking {
-				if raw, ok := gc["thinkingConfig"]; ok && len(raw) > 0 {
-					var tc map[string]json.RawMessage
-					if json.Unmarshal(raw, &tc) == nil {
-						if levelRaw, ok := tc["thinkingLevel"]; ok {
-							var level string
-							if json.Unmarshal(levelRaw, &level) == nil {
-								newLevel := mapThinkingLevel(level)
-								if newLevel != level {
-									tc["thinkingLevel"], _ = json.Marshal(newLevel)
-									gc["thinkingConfig"], _ = json.Marshal(tc)
-									gcChanged = true
-								}
-							}
-						}
-					}
+	if propertiesRaw, ok := schema["properties"]; ok {
+		var properties map[string]json.RawMessage
+		if json.Unmarshal(propertiesRaw, &properties) == nil {
+			propertiesChanged := false
+			for name, child := range properties {
+				normalized, modified, err := normalizeSchema(child)
+				if err != nil {
+					return raw, false, err
+				}
+				if modified {
+					properties[name] = normalized
+					propertiesChanged = true
 				}
 			}
-
-			// responseSchema → responseJsonSchema（新键名已存在则跳过）
-			if needSchema {
-				if _, hasOld := gc["responseSchema"]; hasOld {
-					if _, hasNew := gc["responseJsonSchema"]; !hasNew {
-						gc["responseJsonSchema"] = gc["responseSchema"]
-						delete(gc, "responseSchema")
-						gcChanged = true
-					}
+			if propertiesChanged {
+				encoded, err := json.Marshal(properties)
+				if err != nil {
+					return raw, false, err
 				}
-			}
-
-			if gcChanged {
-				top["generationConfig"], _ = json.Marshal(gc)
+				schema["properties"] = encoded
 				changed = true
 			}
 		}
 	}
 
-	// ── tools 处理 ──
-	// functionDeclarations 内的 parameters/response 重命名
-	if needTools && len(top["tools"]) > 0 {
+	if items, ok := schema["items"]; ok {
+		normalized, modified, err := normalizeSchema(items)
+		if err != nil {
+			return raw, false, err
+		}
+		if modified {
+			schema["items"] = normalized
+			changed = true
+		}
+	}
+
+	if anyOfRaw, ok := schema["anyOf"]; ok {
+		var branches []json.RawMessage
+		if json.Unmarshal(anyOfRaw, &branches) == nil {
+			branchesChanged := false
+			for i, child := range branches {
+				normalized, modified, err := normalizeSchema(child)
+				if err != nil {
+					return raw, false, err
+				}
+				if modified {
+					branches[i] = normalized
+					branchesChanged = true
+				}
+			}
+			if branchesChanged {
+				encoded, err := json.Marshal(branches)
+				if err != nil {
+					return raw, false, err
+				}
+				schema["anyOf"] = encoded
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return raw, false, nil
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return raw, false, err
+	}
+	return encoded, true, nil
+}
+
+// normalizeSchemaField 仅在目标键缺失时改名，然后规范化目标 Schema。
+// 目标键即使为 null 也不覆盖；两键并存时保留来源字段及其原值。
+func normalizeSchemaField(fields map[string]json.RawMessage, target, source string) (bool, error) {
+	raw, exists := fields[target]
+	renamed := false
+	if !exists {
+		raw, exists = fields[source]
+		if !exists {
+			return false, nil
+		}
+		renamed = true
+	}
+
+	normalized, modified, err := normalizeSchema(raw)
+	if err != nil {
+		return false, err
+	}
+	if renamed || modified {
+		fields[target] = normalized
+		if renamed {
+			delete(fields, source)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// normalizeRequestBody 在节点选择前统一规范化普通与 PG 请求，不增加路径分支。
+// 先单次扫描目标字面量，再按需解析；仅有变换时写回一次完整正文。
+// 三处 *JsonSchema 收敛为有类型 Schema，删除 functionCallingConfig，
+// 并保留原有 thinkingLevel 处理。非法 JSON、异常子结构和编码失败不本地拒绝。
+// error 仅用于文件操作失败；成功返回时文件位置始终在开头。
+func normalizeRequestBody(file *os.File) (err error) {
+	patterns := [][]byte{
+		[]byte(`"thinkingLevel"`),
+		[]byte(`"functionDeclarations"`),
+		[]byte(`"responseSchema"`),
+		[]byte(`"responseJsonSchema"`),
+		[]byte(`"functionCallingConfig"`),
+	}
+	hits, err := multiScan(file, patterns)
+	if err != nil {
+		return fmt.Errorf("扫描请求体: %w", err)
+	}
+	needThinking := hits[0]
+	needTools := hits[1]
+	needSchema := hits[2] || hits[3]
+	needToolConfig := hits[4]
+	if !needThinking && !needTools && !needSchema && !needToolConfig {
+		return nil
+	}
+
+	// 包括未修改和内存编码失败的分支，均复位后使用原正文。
+	// 若文件已写入失败，则保留错误并停止转发，不能当作原正文回退。
+	defer func() {
+		if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil && err == nil {
+			err = fmt.Errorf("复位请求体: %w", seekErr)
+		}
+	}()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("读取请求体: %w", err)
+	}
+	var top map[string]json.RawMessage
+	if json.Unmarshal(data, &top) != nil || top == nil {
+		return nil
+	}
+	changed := false
+
+	if needThinking || needSchema {
+		var gc map[string]json.RawMessage
+		if json.Unmarshal(top["generationConfig"], &gc) == nil && gc != nil {
+			gcChanged := false
+			if needThinking {
+				var tc map[string]json.RawMessage
+				if json.Unmarshal(gc["thinkingConfig"], &tc) == nil {
+					var level string
+					if json.Unmarshal(tc["thinkingLevel"], &level) == nil {
+						if newLevel := mapThinkingLevel(level); newLevel != level {
+							tc["thinkingLevel"], err = json.Marshal(newLevel)
+							if err != nil {
+								return nil
+							}
+							gc["thinkingConfig"], err = json.Marshal(tc)
+							if err != nil {
+								return nil
+							}
+							gcChanged = true
+						}
+					}
+				}
+			}
+
+			if needSchema {
+				modified, schemaErr := normalizeSchemaField(gc, "responseSchema", "responseJsonSchema")
+				if schemaErr != nil {
+					return nil
+				}
+				gcChanged = gcChanged || modified
+			}
+			if gcChanged {
+				top["generationConfig"], err = json.Marshal(gc)
+				if err != nil {
+					return nil
+				}
+				changed = true
+			}
+		}
+	}
+
+	if needTools {
 		var tools []json.RawMessage
 		if json.Unmarshal(top["tools"], &tools) == nil {
 			toolsChanged := false
 			for ti, toolRaw := range tools {
 				var tool map[string]json.RawMessage
 				if json.Unmarshal(toolRaw, &tool) != nil {
-					continue
-				}
-				if len(tool["functionDeclarations"]) == 0 {
 					continue
 				}
 				var decls []json.RawMessage
@@ -294,63 +394,87 @@ func normalizeRequestBody(file *os.File) bool {
 				declsChanged := false
 				for di, declRaw := range decls {
 					var decl map[string]json.RawMessage
-					if json.Unmarshal(declRaw, &decl) != nil {
+					if json.Unmarshal(declRaw, &decl) != nil || decl == nil {
 						continue
 					}
-					modified := false
-
-					// parameters → parametersJsonSchema（新键名已存在则跳过）
-					if _, hasOld := decl["parameters"]; hasOld {
-						if _, hasNew := decl["parametersJsonSchema"]; !hasNew {
-							decl["parametersJsonSchema"] = decl["parameters"]
-							delete(decl, "parameters")
-							modified = true
+					declChanged := false
+					for _, names := range [][2]string{
+						{"parameters", "parametersJsonSchema"},
+						{"response", "responseJsonSchema"},
+					} {
+						modified, schemaErr := normalizeSchemaField(decl, names[0], names[1])
+						if schemaErr != nil {
+							return nil
 						}
+						declChanged = declChanged || modified
 					}
-
-					// response → responseJsonSchema（新键名已存在则跳过）
-					if _, hasOld := decl["response"]; hasOld {
-						if _, hasNew := decl["responseJsonSchema"]; !hasNew {
-							decl["responseJsonSchema"] = decl["response"]
-							delete(decl, "response")
-							modified = true
+					if declChanged {
+						decls[di], err = json.Marshal(decl)
+						if err != nil {
+							return nil
 						}
-					}
-
-					if modified {
-						decls[di], _ = json.Marshal(decl)
 						declsChanged = true
 					}
 				}
 				if declsChanged {
-					tool["functionDeclarations"], _ = json.Marshal(decls)
-					tools[ti], _ = json.Marshal(tool)
+					tool["functionDeclarations"], err = json.Marshal(decls)
+					if err != nil {
+						return nil
+					}
+					tools[ti], err = json.Marshal(tool)
+					if err != nil {
+						return nil
+					}
 					toolsChanged = true
 				}
 			}
 			if toolsChanged {
-				top["tools"], _ = json.Marshal(tools)
+				top["tools"], err = json.Marshal(tools)
+				if err != nil {
+					return nil
+				}
+				changed = true
+			}
+		}
+	}
+
+	if needToolConfig {
+		var tc map[string]json.RawMessage
+		if json.Unmarshal(top["toolConfig"], &tc) == nil {
+			if _, exists := tc["functionCallingConfig"]; exists {
+				delete(tc, "functionCallingConfig")
+				top["toolConfig"], err = json.Marshal(tc)
+				if err != nil {
+					return nil
+				}
 				changed = true
 			}
 		}
 	}
 
 	if !changed {
-		file.Seek(0, io.SeekStart)
-		return false
+		return nil
 	}
-
-	// 写回文件
 	newData, err := json.Marshal(top)
 	if err != nil {
-		file.Seek(0, io.SeekStart)
-		return false
+		return nil
 	}
-	file.Seek(0, io.SeekStart)
-	file.Write(newData)
-	file.Truncate(int64(len(newData)))
-	file.Seek(0, io.SeekStart)
-	return true
+
+	// 全部内存变换完成后再写文件；任一步失败都不再转发。
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("定位请求体写入位置: %w", err)
+	}
+	n, err := file.Write(newData)
+	if err != nil {
+		return fmt.Errorf("写回请求体: %w", err)
+	}
+	if n != len(newData) {
+		return fmt.Errorf("写回请求体: %w", io.ErrShortWrite)
+	}
+	if err = file.Truncate(int64(len(newData))); err != nil {
+		return fmt.Errorf("截断请求体: %w", err)
+	}
+	return nil
 }
 
 // mapThinkingLevel 将 thinkingLevel 值映射为 Gemini API 要求的大写枚举。
@@ -718,12 +842,13 @@ func (a *App) Proxy(w http.ResponseWriter, r *http.Request) {
 		os.Remove(name)
 	}()
 
-	// 兼容性处理：规范化请求体中的 Gemini API 字段
-	//   - thinkingLevel 值转为大写枚举（high → HIGH）
-	//   - tools 中 parameters/response 重命名为 parametersJsonSchema/responseJsonSchema
-	//   - generationConfig.responseSchema 重命名为 responseJsonSchema
+	// 统一规范化一次，节点重试复用结果；文件错误不进入节点调度。
 	if r.Method != http.MethodGet {
-		normalizeRequestBody(body)
+		if err := normalizeRequestBody(body); err != nil {
+			rec.Error = err.Error()
+			geminiError(w, http.StatusInternalServerError, "请求体规范化文件操作失败")
+			return
+		}
 	}
 
 	// 2. 构造上游 URL
